@@ -1,8 +1,8 @@
 {
   "id": "obligation-tracker",
   "name": "Obligation Tracker",
-  "description": "Automated task accountability for coordinator agents. Tracks spawned subagent obligations, injects pending tasks into prompts, and detects delivery to close the loop.",
-  "version": "0.1.0",
+  "description": "Automated task accountability for coordinator agents. Tracks spawned subagent obligations, injects pending tasks into prompts, and uses explicit tag-based resolution ([DELIVER:id] / [DISMISS:id]) to close the loop.",
+  "version": "0.2.0",
   "kind": "context-engine",
   "configSchema": {
     "type": "object",
@@ -17,7 +17,7 @@
       "deliveredTtlHours": {
         "type": "number",
         "default": 48,
-        "description": "Hours to keep delivered obligations before cleanup"
+        "description": "Hours to keep delivered/dismissed obligations before cleanup"
       },
       "timeoutGraceSec": {
         "type": "number",

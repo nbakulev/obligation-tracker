@@ -2,16 +2,23 @@
  * Obligation Tracker — automated task accountability for OpenClaw coordinators.
  *
  * Lifecycle:
- *   sessions_spawn  →  after_tool_call   →  REGISTER obligation (RUNNING)
- *   subagent done   →  subagent_ended    →  UPDATE status (ARRIVED / TIMEOUT / FAILED)
- *   every turn      →  before_prompt_build →  INJECT pending obligations into prompt
- *   coordinator msg →  message_sending   →  DETECT delivery, mark DELIVERED
+ *   sessions_spawn  →  after_tool_call     →  REGISTER obligation (RUNNING)
+ *   subagent done   →  subagent_ended      →  UPDATE status (ARRIVED / TIMEOUT / FAILED / CANCELLED)
+ *   every turn      →  before_prompt_build  →  INJECT pending obligations into prompt
+ *   coordinator msg →  message_sending     →  DETECT [DELIVER:id] / [DISMISS:id] tags
  *
- * No step depends on LLM compliance — the gateway enforces all four.
+ * Resolution is tag-based, not NLP-heuristic. The coordinator must include
+ * explicit tags [DELIVER:obl-xxx] or [DISMISS:obl-xxx] in its message to Boss.
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import {
+  readFileSync,
+  writeFileSync,
+  renameSync,
+  mkdirSync,
+  existsSync,
+} from "node:fs";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -23,23 +30,27 @@ interface Obligation {
   targetAgent: string;
   childSessionKey: string;
   runId: string;
-  spawnedAt: string;       // ISO
+  spawnedAt: string; // ISO
   runTimeoutSec: number;
   status: ObligationStatus;
   resultArrivedAt?: string;
   deliveredAt?: string;
+  dismissedAt?: string;
   timeoutAt?: string;
   retryCount: number;
-  outcome?: string;        // from subagent_ended
+  outcome?: string; // from subagent_ended
   error?: string;
+  errorDetail?: string; // extended error context
 }
 
 type ObligationStatus =
   | "RUNNING"
   | "ARRIVED"
   | "DELIVERED"
+  | "DISMISSED"
   | "TIMEOUT"
-  | "FAILED";
+  | "FAILED"
+  | "CANCELLED";
 
 interface PluginConfig {
   coordinatorAgentIds: string[];
@@ -50,6 +61,10 @@ interface PluginConfig {
 
 /** Filename stored inside each coordinator's workspace */
 const OBLIGATIONS_FILE = "obligations.json";
+
+/** Tag patterns for explicit obligation resolution */
+const DELIVER_TAG_RE = /\[DELIVER:(obl-[a-z0-9-]+)\]/gi;
+const DISMISS_TAG_RE = /\[DISMISS:(obl-[a-z0-9-]+)\]/gi;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -77,10 +92,21 @@ function extractTaskSummary(params: Record<string, unknown>): string {
   const firstLine = task
     .split("\n")
     .map((l: string) => l.trim())
-    .find((l: string) => l.length > 10 && !l.startsWith("[") && !l.startsWith("```"));
+    .find(
+      (l: string) =>
+        l.length > 10 && !l.startsWith("[") && !l.startsWith("```"),
+    );
   if (firstLine) return firstLine.slice(0, 120);
   // Fallback: first 120 chars
   return task.replace(/\n/g, " ").slice(0, 120) || "(no task description)";
+}
+
+/**
+ * Deterministic fallback workspace path for when the in-memory cache
+ * is lost (e.g. after gateway restart).
+ */
+function fallbackWorkspaceDir(agentId: string): string {
+  return resolveHome(`~/.openclaw/workspace-${agentId}`);
 }
 
 // ── Store ──────────────────────────────────────────────────────────────────
@@ -90,36 +116,66 @@ function extractTaskSummary(params: Record<string, unknown>): string {
  *
  * Each coordinator's obligations live inside its own workspace directory
  * (e.g. ~/.openclaw/workspace-chat/obligations.json).
- * The workspace path comes from ctx.workspaceDir in hook context.
+ * The workspace path comes from ctx.workspaceDir in hook context,
+ * with a deterministic fallback for resilience across gateway restarts.
  */
 class ObligationStore {
   /** agentId → resolved workspace dir */
   private workspaceDirs = new Map<string, string>();
+  private logger: any;
+
+  constructor(logger: any) {
+    this.logger = logger;
+  }
 
   registerWorkspace(agentId: string, workspaceDir: string): void {
     this.workspaceDirs.set(agentId, workspaceDir);
   }
 
-  private filePath(agentId: string): string | null {
-    const dir = this.workspaceDirs.get(agentId);
-    if (!dir) return null;
+  private filePath(agentId: string): string {
+    const dir =
+      this.workspaceDirs.get(agentId) ?? fallbackWorkspaceDir(agentId);
     return join(dir, OBLIGATIONS_FILE);
   }
 
   load(agentId: string): Obligation[] {
     const fp = this.filePath(agentId);
-    if (!fp || !existsSync(fp)) return [];
+    if (!existsSync(fp)) return [];
+    let raw: string;
     try {
-      return JSON.parse(readFileSync(fp, "utf-8"));
+      raw = readFileSync(fp, "utf-8");
     } catch {
+      return [];
+    }
+    try {
+      return JSON.parse(raw);
+    } catch {
+      // File is corrupted — back it up for manual recovery
+      const corruptedPath = fp.replace(/\.json$/, ".corrupted.json");
+      try {
+        renameSync(fp, corruptedPath);
+        this.logger.error(
+          `obligation-tracker: ${fp} corrupted, backed up to ${corruptedPath}`,
+        );
+      } catch {
+        this.logger.error(
+          `obligation-tracker: ${fp} corrupted and backup failed`,
+        );
+      }
       return [];
     }
   }
 
   save(agentId: string, obligations: Obligation[]): void {
     const fp = this.filePath(agentId);
-    if (!fp) return;
-    writeFileSync(fp, JSON.stringify(obligations, null, 2), "utf-8");
+    const dir = dirname(fp);
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true });
+    }
+    // Atomic write: write to .tmp then rename
+    const tmpPath = fp.replace(/\.json$/, ".tmp.json");
+    writeFileSync(tmpPath, JSON.stringify(obligations, null, 2), "utf-8");
+    renameSync(tmpPath, fp);
   }
 
   add(agentId: string, obligation: Obligation): void {
@@ -141,8 +197,23 @@ class ObligationStore {
     return true;
   }
 
+  updateById(
+    agentId: string,
+    obligationId: string,
+    patch: Partial<Obligation>,
+  ): boolean {
+    const list = this.load(agentId);
+    const idx = list.findIndex((o) => o.id === obligationId);
+    if (idx === -1) return false;
+    list[idx] = { ...list[idx], ...patch };
+    this.save(agentId, list);
+    return true;
+  }
+
   pending(agentId: string): Obligation[] {
-    return this.load(agentId).filter((o) => o.status !== "DELIVERED");
+    return this.load(agentId).filter(
+      (o) => o.status !== "DELIVERED" && o.status !== "DISMISSED",
+    );
   }
 
   gc(agentId: string, ttlHours: number): number {
@@ -150,9 +221,10 @@ class ObligationStore {
     const cutoff = Date.now() - ttlHours * 3600_000;
     const before = list.length;
     const kept = list.filter((o) => {
-      if (o.status !== "DELIVERED") return true;
-      const deliveredMs = o.deliveredAt ? new Date(o.deliveredAt).getTime() : 0;
-      return deliveredMs > cutoff;
+      if (o.status !== "DELIVERED" && o.status !== "DISMISSED") return true;
+      const closedAt = o.deliveredAt || o.dismissedAt;
+      const closedMs = closedAt ? new Date(closedAt).getTime() : 0;
+      return closedMs > cutoff;
     });
     if (kept.length < before) {
       this.save(agentId, kept);
@@ -166,7 +238,8 @@ class ObligationStore {
     let count = 0;
     for (const o of list) {
       if (o.status !== "RUNNING") continue;
-      const deadline = new Date(o.spawnedAt).getTime() + (o.runTimeoutSec + graceSec) * 1000;
+      const deadline =
+        new Date(o.spawnedAt).getTime() + (o.runTimeoutSec + graceSec) * 1000;
       if (now > deadline) {
         o.status = "TIMEOUT";
         o.timeoutAt = new Date().toISOString();
@@ -180,7 +253,33 @@ class ObligationStore {
   /** Find which coordinator owns this childSessionKey */
   findCoordinator(childSessionKey: string): string | undefined {
     for (const agentId of this.workspaceDirs.keys()) {
-      if (this.load(agentId).some((o) => o.childSessionKey === childSessionKey)) {
+      if (
+        this.load(agentId).some((o) => o.childSessionKey === childSessionKey)
+      ) {
+        return agentId;
+      }
+    }
+    return undefined;
+  }
+
+  /** Find coordinator by scanning fallback dirs for all known coordinator IDs */
+  findCoordinatorWithFallback(
+    childSessionKey: string,
+    coordinatorIds: string[],
+  ): string | undefined {
+    // First try cached dirs
+    const cached = this.findCoordinator(childSessionKey);
+    if (cached) return cached;
+    // Fallback: check deterministic paths for all coordinators
+    for (const agentId of coordinatorIds) {
+      if (this.workspaceDirs.has(agentId)) continue; // already checked
+      const fp = join(fallbackWorkspaceDir(agentId), OBLIGATIONS_FILE);
+      if (!existsSync(fp)) continue;
+      // Temporarily register so load() works
+      this.registerWorkspace(agentId, fallbackWorkspaceDir(agentId));
+      if (
+        this.load(agentId).some((o) => o.childSessionKey === childSessionKey)
+      ) {
         return agentId;
       }
     }
@@ -195,7 +294,12 @@ function renderObligations(obligations: Obligation[]): string {
 
   const arrived = obligations.filter((o) => o.status === "ARRIVED");
   const running = obligations.filter((o) => o.status === "RUNNING");
-  const failed = obligations.filter((o) => o.status === "TIMEOUT" || o.status === "FAILED");
+  const failed = obligations.filter(
+    (o) =>
+      o.status === "TIMEOUT" ||
+      o.status === "FAILED" ||
+      o.status === "CANCELLED",
+  );
 
   const lines: string[] = ["<pending-obligations>"];
 
@@ -205,9 +309,9 @@ function renderObligations(obligations: Obligation[]): string {
     );
     for (const o of arrived) {
       lines.push(
-        `  → [RESULT_ARRIVED] ${o.taskLabel} (${o.targetAgent}, spawned ${ago(o.spawnedAt)})`,
+        `  → [RESULT_ARRIVED] id=${o.id} ${o.taskLabel} (${o.targetAgent}, spawned ${ago(o.spawnedAt)})`,
         `    Task: ${o.taskSummary}`,
-        `    Action: Read the result and deliver a synthesis to Boss NOW.`,
+        `    Action: Read the result and deliver a synthesis to Boss. Include [DELIVER:${o.id}] in your message.`,
         "",
       );
     }
@@ -217,7 +321,7 @@ function renderObligations(obligations: Obligation[]): string {
     lines.push(`${running.length} obligation(s) still RUNNING:\n`);
     for (const o of running) {
       lines.push(
-        `  ⏳ [RUNNING] ${o.taskLabel} (${o.targetAgent}, spawned ${ago(o.spawnedAt)}, timeout ${o.runTimeoutSec}s)`,
+        `  ⏳ [RUNNING] id=${o.id} ${o.taskLabel} (${o.targetAgent}, spawned ${ago(o.spawnedAt)}, timeout ${o.runTimeoutSec}s)`,
         `    Task: ${o.taskSummary}`,
         "",
       );
@@ -225,20 +329,25 @@ function renderObligations(obligations: Obligation[]): string {
   }
 
   if (failed.length > 0) {
-    lines.push(`${failed.length} obligation(s) FAILED/TIMEOUT — inform Boss and decide on retry:\n`);
+    lines.push(
+      `${failed.length} obligation(s) FAILED/TIMEOUT/CANCELLED — inform Boss and decide on retry:\n`,
+    );
     for (const o of failed) {
-      const reason = o.error || o.outcome || "unknown";
+      const reason = o.errorDetail || o.error || o.outcome || "unknown";
       lines.push(
-        `  ✗ [${o.status}] ${o.taskLabel} (${o.targetAgent}, reason: ${reason})`,
+        `  ✗ [${o.status}] id=${o.id} ${o.taskLabel} (${o.targetAgent}, reason: ${reason})`,
         `    Task: ${o.taskSummary}`,
+        `    Action: Report to Boss and include [DISMISS:${o.id}] to acknowledge, or retry the task.`,
         "",
       );
     }
   }
 
   lines.push(
-    "Rule: RESULT_ARRIVED obligations MUST be resolved before starting new work.",
-    "Rule: TIMEOUT/FAILED obligations MUST be reported to Boss (retry or explain).",
+    "Resolution protocol:",
+    "  - To mark a successful result as delivered: include [DELIVER:<obligation-id>] in your message to Boss.",
+    "  - To dismiss a FAILED/TIMEOUT/CANCELLED task after reporting: include [DISMISS:<obligation-id>].",
+    "  - RESULT_ARRIVED obligations MUST be resolved before starting new work.",
     "</pending-obligations>",
   );
 
@@ -254,18 +363,17 @@ export default {
       coordinatorAgentIds: Array.isArray(raw.coordinatorAgentIds)
         ? (raw.coordinatorAgentIds as string[])
         : ["chat"],
-      deliveredTtlHours: typeof raw.deliveredTtlHours === "number"
-        ? raw.deliveredTtlHours
-        : 48,
-      timeoutGraceSec: typeof raw.timeoutGraceSec === "number"
-        ? raw.timeoutGraceSec
-        : 60,
-      injectPriority: typeof raw.injectPriority === "number"
-        ? raw.injectPriority
-        : 18,
+      deliveredTtlHours:
+        typeof raw.deliveredTtlHours === "number"
+          ? raw.deliveredTtlHours
+          : 48,
+      timeoutGraceSec:
+        typeof raw.timeoutGraceSec === "number" ? raw.timeoutGraceSec : 60,
+      injectPriority:
+        typeof raw.injectPriority === "number" ? raw.injectPriority : 18,
     };
 
-    const store = new ObligationStore();
+    const store = new ObligationStore(api.logger);
     const isCoordinator = (agentId?: string) =>
       agentId != null && cfg.coordinatorAgentIds.includes(agentId);
 
@@ -285,166 +393,217 @@ export default {
 
     // ── Hook 1: AUTO-REGISTER on sessions_spawn ──────────────────────────
 
-    api.on("after_tool_call", (event: any, ctx: any) => {
-      ensureWorkspace(ctx);
-      if (event.toolName !== "sessions_spawn") return;
-      if (!isCoordinator(ctx.agentId)) return;
+    api.on(
+      "after_tool_call",
+      (event: any, ctx: any) => {
+        ensureWorkspace(ctx);
+        if (event.toolName !== "sessions_spawn") return;
+        if (!isCoordinator(ctx.agentId)) return;
 
-      const result = event.result as Record<string, unknown> | undefined;
-      if (!result || result.status !== "accepted") return;
+        const result = event.result as Record<string, unknown> | undefined;
+        if (!result || result.status !== "accepted") return;
 
-      const params = (event.params ?? {}) as Record<string, unknown>;
-      const childSessionKey = result.childSessionKey as string;
-      const coordinatorId = ctx.agentId as string;
+        const params = (event.params ?? {}) as Record<string, unknown>;
+        const childSessionKey = result.childSessionKey as string;
+        const coordinatorId = ctx.agentId as string;
 
-      // Avoid duplicates (re-spawn of same session)
-      const existing = store.load(coordinatorId);
-      if (existing.some((o) => o.childSessionKey === childSessionKey)) return;
+        // Avoid duplicates (re-spawn of same session)
+        const existing = store.load(coordinatorId);
+        if (existing.some((o) => o.childSessionKey === childSessionKey)) return;
 
-      const obligation: Obligation = {
-        id: genId(),
-        taskLabel: (typeof params.label === "string" ? params.label : "") ||
-          `${params.agentId || "subagent"}-${Date.now().toString(36)}`,
-        taskSummary: extractTaskSummary(params),
-        targetAgent: (typeof params.agentId === "string" ? params.agentId : "unknown"),
-        childSessionKey,
-        runId: (result.runId as string) || "",
-        spawnedAt: new Date().toISOString(),
-        runTimeoutSec: typeof params.runTimeoutSeconds === "number"
-          ? params.runTimeoutSeconds
-          : 600,
-        status: "RUNNING",
-        retryCount: 0,
-      };
+        const obligation: Obligation = {
+          id: genId(),
+          taskLabel:
+            (typeof params.label === "string" ? params.label : "") ||
+            `${params.agentId || "subagent"}-${Date.now().toString(36)}`,
+          taskSummary: extractTaskSummary(params),
+          targetAgent:
+            typeof params.agentId === "string" ? params.agentId : "unknown",
+          childSessionKey,
+          runId: (result.runId as string) || "",
+          spawnedAt: new Date().toISOString(),
+          runTimeoutSec:
+            typeof params.runTimeoutSeconds === "number"
+              ? params.runTimeoutSeconds
+              : 600,
+          status: "RUNNING",
+          retryCount: 0,
+        };
 
-      // Detect retry: same label with previous TIMEOUT/FAILED
-      const prev = existing.find(
-        (o) =>
-          o.taskLabel === obligation.taskLabel &&
-          (o.status === "TIMEOUT" || o.status === "FAILED"),
-      );
-      if (prev) {
-        obligation.retryCount = prev.retryCount + 1;
-        // Remove the old failed entry — retry replaces it
-        const cleaned = existing.filter((o) => o.id !== prev.id);
-        cleaned.push(obligation);
-        store.save(coordinatorId, cleaned);
-      } else {
-        store.add(coordinatorId, obligation);
-      }
+        // Detect retry: same label with previous TIMEOUT/FAILED
+        const prev = existing.find(
+          (o) =>
+            o.taskLabel === obligation.taskLabel &&
+            (o.status === "TIMEOUT" || o.status === "FAILED"),
+        );
+        if (prev) {
+          obligation.retryCount = prev.retryCount + 1;
+          // Remove the old failed entry — retry replaces it
+          const cleaned = existing.filter((o) => o.id !== prev.id);
+          cleaned.push(obligation);
+          store.save(coordinatorId, cleaned);
+        } else {
+          store.add(coordinatorId, obligation);
+        }
 
-      sessionToCoordinator.set(childSessionKey, coordinatorId);
+        sessionToCoordinator.set(childSessionKey, coordinatorId);
 
-      api.logger.info(
-        `obligation-tracker: registered [${obligation.taskLabel}] → ${obligation.targetAgent} (retry=${obligation.retryCount})`,
-      );
-    }, { priority: 10 });
+        api.logger.info(
+          `obligation-tracker: registered [${obligation.taskLabel}] → ${obligation.targetAgent} (retry=${obligation.retryCount})`,
+        );
+      },
+      { priority: 10 },
+    );
 
     // ── Hook 2: AUTO-UPDATE on subagent_ended ────────────────────────────
 
-    api.on("subagent_ended", (event: any, ctx: any) => {
-      const childKey = event.targetSessionKey || ctx.childSessionKey;
-      if (!childKey) return;
+    api.on(
+      "subagent_ended",
+      (event: any, _ctx: any) => {
+        const childKey = event.targetSessionKey || _ctx.childSessionKey;
+        if (!childKey) return;
 
-      // Find which coordinator owns this obligation
-      let coordinatorId = sessionToCoordinator.get(childKey);
-      if (!coordinatorId) {
-        coordinatorId = store.findCoordinator(childKey);
-      }
-      if (!coordinatorId) return;
+        // Find which coordinator owns this obligation (with fallback for restarts)
+        let coordinatorId = sessionToCoordinator.get(childKey);
+        if (!coordinatorId) {
+          coordinatorId = store.findCoordinatorWithFallback(
+            childKey,
+            cfg.coordinatorAgentIds,
+          );
+        }
+        if (!coordinatorId) return;
 
-      const outcome = event.outcome || "ok";
-      const isSuccess = outcome === "ok";
-      const isTimeout = outcome === "timeout";
-      const isError = outcome === "error" || outcome === "killed";
+        const outcome = event.outcome || "ok";
+        const isSuccess = outcome === "ok";
+        const isTimeout = outcome === "timeout";
+        const isKilled = outcome === "killed";
+        const isError = outcome === "error";
 
-      let newStatus: ObligationStatus;
-      if (isSuccess) newStatus = "ARRIVED";
-      else if (isTimeout) newStatus = "TIMEOUT";
-      else if (isError) newStatus = "FAILED";
-      else newStatus = "ARRIVED"; // Default: treat as arrived, let coordinator judge
+        let newStatus: ObligationStatus;
+        if (isSuccess) newStatus = "ARRIVED";
+        else if (isTimeout) newStatus = "TIMEOUT";
+        else if (isKilled) newStatus = "CANCELLED";
+        else if (isError) newStatus = "FAILED";
+        else newStatus = "ARRIVED"; // Default: treat as arrived, let coordinator judge
 
-      const patch: Partial<Obligation> = {
-        status: newStatus,
-        outcome,
-        error: event.error,
-      };
+        // Extract extended error detail if available
+        let errorDetail: string | undefined;
+        if (event.error) {
+          errorDetail =
+            typeof event.error === "string"
+              ? event.error
+              : JSON.stringify(event.error);
+        }
+        if (event.details) {
+          const details =
+            typeof event.details === "string"
+              ? event.details
+              : JSON.stringify(event.details);
+          errorDetail = errorDetail
+            ? `${errorDetail} | ${details}`
+            : details;
+        }
+        // Truncate to keep prompt injection surface small
+        if (errorDetail && errorDetail.length > 500) {
+          errorDetail = errorDetail.slice(-500);
+        }
 
-      if (newStatus === "ARRIVED") {
-        patch.resultArrivedAt = new Date().toISOString();
-      } else if (newStatus === "TIMEOUT") {
-        patch.timeoutAt = new Date().toISOString();
-      }
+        const patch: Partial<Obligation> = {
+          status: newStatus,
+          outcome,
+          error: event.error,
+          errorDetail,
+        };
 
-      const updated = store.update(coordinatorId, childKey, patch);
-      if (updated) {
-        api.logger.info(
-          `obligation-tracker: [${childKey}] → ${newStatus} (outcome=${outcome})`,
-        );
-      }
+        if (newStatus === "ARRIVED") {
+          patch.resultArrivedAt = new Date().toISOString();
+        } else if (newStatus === "TIMEOUT") {
+          patch.timeoutAt = new Date().toISOString();
+        }
 
-      sessionToCoordinator.delete(childKey);
-    }, { priority: 10 });
+        const updated = store.update(coordinatorId, childKey, patch);
+        if (updated) {
+          api.logger.info(
+            `obligation-tracker: [${childKey}] → ${newStatus} (outcome=${outcome})`,
+          );
+        }
+
+        sessionToCoordinator.delete(childKey);
+      },
+      { priority: 10 },
+    );
 
     // ── Hook 3: INJECT obligations into coordinator prompt ───────────────
 
-    api.on("before_prompt_build", (_event: any, ctx: any) => {
-      ensureWorkspace(ctx);
-      if (!isCoordinator(ctx.agentId)) return;
+    api.on(
+      "before_prompt_build",
+      (_event: any, ctx: any) => {
+        ensureWorkspace(ctx);
+        if (!isCoordinator(ctx.agentId)) return;
 
-      const coordinatorId = ctx.agentId as string;
+        const coordinatorId = ctx.agentId as string;
 
-      // Run maintenance: check timeouts + GC
-      store.checkTimeouts(coordinatorId, cfg.timeoutGraceSec);
-      store.gc(coordinatorId, cfg.deliveredTtlHours);
+        // Run maintenance: check timeouts + GC
+        store.checkTimeouts(coordinatorId, cfg.timeoutGraceSec);
+        store.gc(coordinatorId, cfg.deliveredTtlHours);
 
-      const pending = store.pending(coordinatorId);
-      if (pending.length === 0) return;
+        const pending = store.pending(coordinatorId);
+        if (pending.length === 0) return;
 
-      const block = renderObligations(pending);
-      if (!block) return;
+        const block = renderObligations(pending);
+        if (!block) return;
 
-      return { prependContext: block };
-    }, { priority: cfg.injectPriority });
+        return { prependContext: block };
+      },
+      { priority: cfg.injectPriority },
+    );
 
-    // ── Hook 4: AUTO-RESOLVE on message delivery to Boss ─────────────────
+    // ── Hook 4: TAG-BASED RESOLUTION on message to Boss ──────────────────
 
-    api.on("message_sending", (event: any, ctx: any) => {
-      ensureWorkspace(ctx);
-      if (!isCoordinator(ctx.agentId)) return;
-      const coordinatorId = ctx.agentId as string;
+    api.on(
+      "message_sending",
+      (event: any, ctx: any) => {
+        ensureWorkspace(ctx);
+        if (!isCoordinator(ctx.agentId)) return;
+        const coordinatorId = ctx.agentId as string;
 
-      const content = typeof event.content === "string" ? event.content : "";
-      if (content.length < 20) return; // Skip short messages (acks, emojis)
+        const content =
+          typeof event.content === "string" ? event.content : "";
+        if (content.length < 10) return;
 
-      const pending = store.pending(coordinatorId);
-      const arrived = pending.filter((o) => o.status === "ARRIVED");
-      if (arrived.length === 0) return;
-
-      const contentLower = content.toLowerCase();
-
-      for (const o of arrived) {
-        // Heuristic: message references the task label or target agent
-        const labelWords = o.taskLabel
-          .toLowerCase()
-          .split(/[-_\s]+/)
-          .filter((w) => w.length > 2);
-
-        const matched =
-          labelWords.some((w) => contentLower.includes(w)) ||
-          contentLower.includes(o.targetAgent.toLowerCase());
-
-        if (matched) {
-          store.update(coordinatorId, o.childSessionKey, {
+        // Scan for [DELIVER:obl-xxx] tags
+        let match: RegExpExecArray | null;
+        DELIVER_TAG_RE.lastIndex = 0;
+        while ((match = DELIVER_TAG_RE.exec(content)) !== null) {
+          const oblId = match[1];
+          const updated = store.updateById(coordinatorId, oblId, {
             status: "DELIVERED",
             deliveredAt: new Date().toISOString(),
           });
-          api.logger.info(
-            `obligation-tracker: [${o.taskLabel}] → DELIVERED (auto-resolved via message content)`,
-          );
+          if (updated) {
+            api.logger.info(
+              `obligation-tracker: [${oblId}] → DELIVERED (explicit tag)`,
+            );
+          }
         }
-      }
-    }, { priority: 10 });
+
+        // Scan for [DISMISS:obl-xxx] tags
+        DISMISS_TAG_RE.lastIndex = 0;
+        while ((match = DISMISS_TAG_RE.exec(content)) !== null) {
+          const oblId = match[1];
+          const updated = store.updateById(coordinatorId, oblId, {
+            status: "DISMISSED",
+            dismissedAt: new Date().toISOString(),
+          });
+          if (updated) {
+            api.logger.info(
+              `obligation-tracker: [${oblId}] → DISMISSED (explicit tag)`,
+            );
+          }
+        }
+      },
+      { priority: 10 },
+    );
 
     api.logger.info("obligation-tracker: all hooks registered");
   },
