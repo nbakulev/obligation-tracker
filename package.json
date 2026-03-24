@@ -1,0 +1,15 @@
+{
+  "name": "@nicknewlife/obligation-tracker",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.ts",
+  "description": "Automated task accountability plugin for OpenClaw coordinator agents",
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  },
+  "keywords": ["openclaw", "plugin", "obligations", "task-tracking", "accountability"],
+  "license": "MIT",
+  "peerDependencies": {
+    "openclaw": "*"
+  }
+}

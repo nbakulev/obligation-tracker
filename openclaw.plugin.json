@@ -1,0 +1,39 @@
+{
+  "id": "obligation-tracker",
+  "name": "Obligation Tracker",
+  "description": "Automated task accountability for coordinator agents. Tracks spawned subagent obligations, injects pending tasks into prompts, and detects delivery to close the loop.",
+  "version": "0.1.0",
+  "kind": "context-engine",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "coordinatorAgentIds": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": ["chat"],
+        "description": "Agent IDs that act as coordinators (obligations are tracked for these agents)"
+      },
+      "storagePath": {
+        "type": "string",
+        "default": "~/.openclaw/obligations",
+        "description": "Directory for obligation state files"
+      },
+      "deliveredTtlHours": {
+        "type": "number",
+        "default": 48,
+        "description": "Hours to keep delivered obligations before cleanup"
+      },
+      "timeoutGraceSec": {
+        "type": "number",
+        "default": 60,
+        "description": "Grace period (seconds) after runTimeout before marking obligation as TIMEOUT"
+      },
+      "injectPriority": {
+        "type": "number",
+        "default": 18,
+        "description": "Priority for before_prompt_build hook (higher = runs earlier)"
+      }
+    }
+  }
+}
