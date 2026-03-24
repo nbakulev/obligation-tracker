@@ -64,7 +64,9 @@ Add to `openclaw.json`:
       "obligation-tracker": {
         "enabled": true,
         "config": {
-          "coordinatorAgentIds": ["chat"]
+          "coordinatorAgentIds": ["chat"],
+          "deliveredTtlHours": 48,
+          "timeoutGraceSec": 60
         }
       }
     }
@@ -83,7 +85,6 @@ openclaw gateway restart
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `coordinatorAgentIds` | string[] | `["chat"]` | Agent IDs to track obligations for |
-| `storagePath` | string | `~/.openclaw/obligations` | Directory for obligation state files |
 | `deliveredTtlHours` | number | `48` | Hours to keep delivered obligations before cleanup |
 | `timeoutGraceSec` | number | `60` | Grace period after `runTimeout` before marking TIMEOUT |
 | `injectPriority` | number | `18` | Priority for `before_prompt_build` hook |
@@ -117,15 +118,14 @@ When the coordinator sends a message, the plugin checks if the content reference
 
 ## Storage
 
-Obligations are stored as JSON files per coordinator:
+Obligations are stored inside each coordinator's workspace directory:
 
 ```
-~/.openclaw/obligations/
-  chat.json       # Hubo's obligations
-  editor.json     # Editor's obligations (if configured)
+~/.openclaw/workspace-chat/obligations.json       # Hubo's obligations
+~/.openclaw/workspace-editor/obligations.json     # Editor's obligations (if configured)
 ```
 
-Files survive gateway restarts. On startup, `RUNNING` obligations past their timeout are automatically marked `TIMEOUT`.
+The workspace path is resolved automatically from hook context (`ctx.workspaceDir`) — no path configuration needed. Files survive gateway restarts. On startup, `RUNNING` obligations past their timeout are automatically marked `TIMEOUT`.
 
 ## License
 

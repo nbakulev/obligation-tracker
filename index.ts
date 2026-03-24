@@ -43,11 +43,13 @@ type ObligationStatus =
 
 interface PluginConfig {
   coordinatorAgentIds: string[];
-  storagePath: string;
   deliveredTtlHours: number;
   timeoutGraceSec: number;
   injectPriority: number;
 }
+
+/** Filename stored inside each coordinator's workspace */
+const OBLIGATIONS_FILE = "obligations.json";
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -83,21 +85,30 @@ function extractTaskSummary(params: Record<string, unknown>): string {
 
 // ── Store ──────────────────────────────────────────────────────────────────
 
+/**
+ * Workspace-local obligation store.
+ *
+ * Each coordinator's obligations live inside its own workspace directory
+ * (e.g. ~/.openclaw/workspace-chat/obligations.json).
+ * The workspace path comes from ctx.workspaceDir in hook context.
+ */
 class ObligationStore {
-  private dir: string;
+  /** agentId → resolved workspace dir */
+  private workspaceDirs = new Map<string, string>();
 
-  constructor(basePath: string) {
-    this.dir = resolveHome(basePath);
-    mkdirSync(this.dir, { recursive: true });
+  registerWorkspace(agentId: string, workspaceDir: string): void {
+    this.workspaceDirs.set(agentId, workspaceDir);
   }
 
-  private filePath(coordinatorId: string): string {
-    return join(this.dir, `${coordinatorId}.json`);
+  private filePath(agentId: string): string | null {
+    const dir = this.workspaceDirs.get(agentId);
+    if (!dir) return null;
+    return join(dir, OBLIGATIONS_FILE);
   }
 
-  load(coordinatorId: string): Obligation[] {
-    const fp = this.filePath(coordinatorId);
-    if (!existsSync(fp)) return [];
+  load(agentId: string): Obligation[] {
+    const fp = this.filePath(agentId);
+    if (!fp || !existsSync(fp)) return [];
     try {
       return JSON.parse(readFileSync(fp, "utf-8"));
     } catch {
@@ -105,39 +116,37 @@ class ObligationStore {
     }
   }
 
-  save(coordinatorId: string, obligations: Obligation[]): void {
-    writeFileSync(this.filePath(coordinatorId), JSON.stringify(obligations, null, 2), "utf-8");
+  save(agentId: string, obligations: Obligation[]): void {
+    const fp = this.filePath(agentId);
+    if (!fp) return;
+    writeFileSync(fp, JSON.stringify(obligations, null, 2), "utf-8");
   }
 
-  add(coordinatorId: string, obligation: Obligation): void {
-    const list = this.load(coordinatorId);
+  add(agentId: string, obligation: Obligation): void {
+    const list = this.load(agentId);
     list.push(obligation);
-    this.save(coordinatorId, list);
+    this.save(agentId, list);
   }
 
   update(
-    coordinatorId: string,
+    agentId: string,
     childSessionKey: string,
     patch: Partial<Obligation>,
   ): boolean {
-    const list = this.load(coordinatorId);
+    const list = this.load(agentId);
     const idx = list.findIndex((o) => o.childSessionKey === childSessionKey);
     if (idx === -1) return false;
     list[idx] = { ...list[idx], ...patch };
-    this.save(coordinatorId, list);
+    this.save(agentId, list);
     return true;
   }
 
-  /** Get active (non-delivered, non-expired) obligations */
-  pending(coordinatorId: string): Obligation[] {
-    return this.load(coordinatorId).filter(
-      (o) => o.status !== "DELIVERED",
-    );
+  pending(agentId: string): Obligation[] {
+    return this.load(agentId).filter((o) => o.status !== "DELIVERED");
   }
 
-  /** Remove delivered obligations older than ttlHours */
-  gc(coordinatorId: string, ttlHours: number): number {
-    const list = this.load(coordinatorId);
+  gc(agentId: string, ttlHours: number): number {
+    const list = this.load(agentId);
     const cutoff = Date.now() - ttlHours * 3600_000;
     const before = list.length;
     const kept = list.filter((o) => {
@@ -146,14 +155,13 @@ class ObligationStore {
       return deliveredMs > cutoff;
     });
     if (kept.length < before) {
-      this.save(coordinatorId, kept);
+      this.save(agentId, kept);
     }
     return before - kept.length;
   }
 
-  /** Check RUNNING obligations for timeout */
-  checkTimeouts(coordinatorId: string, graceSec: number): number {
-    const list = this.load(coordinatorId);
+  checkTimeouts(agentId: string, graceSec: number): number {
+    const list = this.load(agentId);
     const now = Date.now();
     let count = 0;
     for (const o of list) {
@@ -165,8 +173,18 @@ class ObligationStore {
         count++;
       }
     }
-    if (count > 0) this.save(coordinatorId, list);
+    if (count > 0) this.save(agentId, list);
     return count;
+  }
+
+  /** Find which coordinator owns this childSessionKey */
+  findCoordinator(childSessionKey: string): string | undefined {
+    for (const agentId of this.workspaceDirs.keys()) {
+      if (this.load(agentId).some((o) => o.childSessionKey === childSessionKey)) {
+        return agentId;
+      }
+    }
+    return undefined;
   }
 }
 
@@ -236,9 +254,6 @@ export default {
       coordinatorAgentIds: Array.isArray(raw.coordinatorAgentIds)
         ? (raw.coordinatorAgentIds as string[])
         : ["chat"],
-      storagePath: typeof raw.storagePath === "string"
-        ? raw.storagePath
-        : "~/.openclaw/obligations",
       deliveredTtlHours: typeof raw.deliveredTtlHours === "number"
         ? raw.deliveredTtlHours
         : 48,
@@ -250,20 +265,28 @@ export default {
         : 18,
     };
 
-    const store = new ObligationStore(cfg.storagePath);
+    const store = new ObligationStore();
     const isCoordinator = (agentId?: string) =>
       agentId != null && cfg.coordinatorAgentIds.includes(agentId);
+
+    /** Ensure workspace dir is registered from any hook context */
+    const ensureWorkspace = (ctx: any) => {
+      if (ctx.agentId && ctx.workspaceDir && isCoordinator(ctx.agentId)) {
+        store.registerWorkspace(ctx.agentId, ctx.workspaceDir);
+      }
+    };
 
     // Map childSessionKey → coordinatorAgentId for delivery routing
     const sessionToCoordinator = new Map<string, string>();
 
     api.logger.info(
-      `obligation-tracker: initialized (coordinators: ${cfg.coordinatorAgentIds.join(", ")}, storage: ${cfg.storagePath})`,
+      `obligation-tracker: initialized (coordinators: ${cfg.coordinatorAgentIds.join(", ")}, storage: workspace-local)`,
     );
 
     // ── Hook 1: AUTO-REGISTER on sessions_spawn ──────────────────────────
 
     api.on("after_tool_call", (event: any, ctx: any) => {
+      ensureWorkspace(ctx);
       if (event.toolName !== "sessions_spawn") return;
       if (!isCoordinator(ctx.agentId)) return;
 
@@ -326,14 +349,7 @@ export default {
       // Find which coordinator owns this obligation
       let coordinatorId = sessionToCoordinator.get(childKey);
       if (!coordinatorId) {
-        // Fallback: scan all coordinators
-        for (const cid of cfg.coordinatorAgentIds) {
-          const list = store.load(cid);
-          if (list.some((o) => o.childSessionKey === childKey)) {
-            coordinatorId = cid;
-            break;
-          }
-        }
+        coordinatorId = store.findCoordinator(childKey);
       }
       if (!coordinatorId) return;
 
@@ -373,6 +389,7 @@ export default {
     // ── Hook 3: INJECT obligations into coordinator prompt ───────────────
 
     api.on("before_prompt_build", (_event: any, ctx: any) => {
+      ensureWorkspace(ctx);
       if (!isCoordinator(ctx.agentId)) return;
 
       const coordinatorId = ctx.agentId as string;
@@ -393,6 +410,7 @@ export default {
     // ── Hook 4: AUTO-RESOLVE on message delivery to Boss ─────────────────
 
     api.on("message_sending", (event: any, ctx: any) => {
+      ensureWorkspace(ctx);
       if (!isCoordinator(ctx.agentId)) return;
       const coordinatorId = ctx.agentId as string;
 

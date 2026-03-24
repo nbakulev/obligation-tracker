@@ -14,11 +14,6 @@
         "default": ["chat"],
         "description": "Agent IDs that act as coordinators (obligations are tracked for these agents)"
       },
-      "storagePath": {
-        "type": "string",
-        "default": "~/.openclaw/obligations",
-        "description": "Directory for obligation state files"
-      },
       "deliveredTtlHours": {
         "type": "number",
         "default": 48,
