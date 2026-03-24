@@ -66,6 +66,44 @@ const OBLIGATIONS_FILE = "obligations.json";
 const DELIVER_TAG_RE = /\[DELIVER:(obl-[a-z0-9-]+)\]/gi;
 const DISMISS_TAG_RE = /\[DISMISS:(obl-[a-z0-9-]+)\]/gi;
 
+/**
+ * Extract the logical tool result payload from the hook event.
+ *
+ * Gateway wraps tool results in pi-agent content blocks:
+ *   { content: [{ type: "text", text: '{"status":"accepted",...}' }] }
+ *
+ * This helper unwraps that structure and parses the inner JSON so
+ * the plugin can read fields like `result.status` and `result.childSessionKey`.
+ */
+function unwrapToolResult(raw: unknown): Record<string, unknown> | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const record = raw as Record<string, unknown>;
+
+  // Direct object with .status — already unwrapped (future-proof)
+  if (typeof record.status === "string") return record;
+
+  // pi-agent content-block wrapper
+  const content = Array.isArray(record.content) ? record.content : undefined;
+  if (!content) return undefined;
+
+  for (const block of content) {
+    if (
+      block &&
+      typeof block === "object" &&
+      (block as Record<string, unknown>).type === "text" &&
+      typeof (block as Record<string, unknown>).text === "string"
+    ) {
+      try {
+        const parsed = JSON.parse((block as Record<string, unknown>).text as string);
+        if (parsed && typeof parsed === "object") return parsed as Record<string, unknown>;
+      } catch {
+        // not JSON — skip
+      }
+    }
+  }
+  return undefined;
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function resolveHome(p: string): string {
@@ -400,7 +438,7 @@ export default {
         if (event.toolName !== "sessions_spawn") return;
         if (!isCoordinator(ctx.agentId)) return;
 
-        const result = event.result as Record<string, unknown> | undefined;
+        const result = unwrapToolResult(event.result);
         if (!result || result.status !== "accepted") return;
 
         const params = (event.params ?? {}) as Record<string, unknown>;
@@ -508,6 +546,21 @@ export default {
           errorDetail = errorDetail.slice(-500);
         }
 
+        // Guard: never overwrite a terminal status (DELIVERED/DISMISSED)
+        // This prevents a late subagent_ended from clobbering an already-resolved obligation
+        const existing = store.load(coordinatorId);
+        const current = existing.find((o) => o.childSessionKey === childKey);
+        if (
+          current &&
+          (current.status === "DELIVERED" || current.status === "DISMISSED")
+        ) {
+          api.logger.info(
+            `obligation-tracker: [${childKey}] subagent_ended (outcome=${outcome}) ignored — already ${current.status}`,
+          );
+          sessionToCoordinator.delete(childKey);
+          return;
+        }
+
         const patch: Partial<Obligation> = {
           status: newStatus,
           outcome,
@@ -559,46 +612,58 @@ export default {
     );
 
     // ── Hook 4: TAG-BASED RESOLUTION on message to Boss ──────────────────
+    //
+    // Note: message_sending hook context provides channelId/accountId but
+    // NOT agentId (PluginHookMessageContext). We scan tags against ALL
+    // coordinator stores to find matching obligation IDs.
 
     api.on(
       "message_sending",
-      (event: any, ctx: any) => {
-        ensureWorkspace(ctx);
-        if (!isCoordinator(ctx.agentId)) return;
-        const coordinatorId = ctx.agentId as string;
-
+      (event: any, _ctx: any) => {
         const content =
           typeof event.content === "string" ? event.content : "";
         if (content.length < 10) return;
 
-        // Scan for [DELIVER:obl-xxx] tags
+        // Collect all obligation IDs mentioned in tags
+        const deliverIds: string[] = [];
+        const dismissIds: string[] = [];
+
         let match: RegExpExecArray | null;
         DELIVER_TAG_RE.lastIndex = 0;
         while ((match = DELIVER_TAG_RE.exec(content)) !== null) {
-          const oblId = match[1];
-          const updated = store.updateById(coordinatorId, oblId, {
-            status: "DELIVERED",
-            deliveredAt: new Date().toISOString(),
-          });
-          if (updated) {
-            api.logger.info(
-              `obligation-tracker: [${oblId}] → DELIVERED (explicit tag)`,
-            );
-          }
+          deliverIds.push(match[1]);
         }
-
-        // Scan for [DISMISS:obl-xxx] tags
         DISMISS_TAG_RE.lastIndex = 0;
         while ((match = DISMISS_TAG_RE.exec(content)) !== null) {
-          const oblId = match[1];
-          const updated = store.updateById(coordinatorId, oblId, {
-            status: "DISMISSED",
-            dismissedAt: new Date().toISOString(),
-          });
-          if (updated) {
-            api.logger.info(
-              `obligation-tracker: [${oblId}] → DISMISSED (explicit tag)`,
-            );
+          dismissIds.push(match[1]);
+        }
+
+        if (deliverIds.length === 0 && dismissIds.length === 0) return;
+
+        // Try each coordinator store for matching obligation IDs
+        for (const coordinatorId of cfg.coordinatorAgentIds) {
+          for (const oblId of deliverIds) {
+            const updated = store.updateById(coordinatorId, oblId, {
+              status: "DELIVERED",
+              deliveredAt: new Date().toISOString(),
+            });
+            if (updated) {
+              api.logger.info(
+                `obligation-tracker: [${oblId}] → DELIVERED (explicit tag)`,
+              );
+            }
+          }
+
+          for (const oblId of dismissIds) {
+            const updated = store.updateById(coordinatorId, oblId, {
+              status: "DISMISSED",
+              dismissedAt: new Date().toISOString(),
+            });
+            if (updated) {
+              api.logger.info(
+                `obligation-tracker: [${oblId}] → DISMISSED (explicit tag)`,
+              );
+            }
           }
         }
       },
