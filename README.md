@@ -47,7 +47,7 @@ The LLM cannot opt out — this is part of the prompt, injected by the gateway.
 
 ```bash
 # Clone into extensions
-git clone https://github.com/nicknewlife/obligation-tracker.git \
+git clone https://github.com/nbakulev/obligation-tracker.git \
   ~/.openclaw/extensions/obligation-tracker
 
 # Register in openclaw.json
